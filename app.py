@@ -99,6 +99,19 @@ def get_website_text(url):
 # --- เริ่มต้นโปรแกรม ---
 st.set_page_config(page_title="Pro FDA Auditor", layout="wide", page_icon="⚖️")
 
+st.markdown("""
+<style>
+    .verdict-box {padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px;}
+    .verdict-pass {background-color: #d4edda; color: #155724; border: 2px solid #c3e6cb;}
+    .verdict-fail {background-color: #f8d7da; color: #721c24; border: 2px solid #f5c6cb;}
+    .verdict-title {font-size: 24px !important; font-weight: bold; margin-bottom: 5px !important;}
+
+    table {width: 100% !important; border-collapse: collapse;}
+    th {background-color: #f2f2f2 !important; color: #333 !important; font-weight: bold !important; font-size: 16px !important; text-align: center !important;}
+    td {font-size: 15px !important; vertical-align: top !important; border-bottom: 1px solid #ddd !important;}
+</style>
+""", unsafe_allow_html=True)
+
 # เช็ค Login ก่อน! ถ้าผ่านถึงจะรันโค้ดข้างล่างนี้
 if init_login_page():
     
@@ -189,23 +202,46 @@ if init_login_page():
                             system_role = "คุณคือผู้เชี่ยวชาญด้านกฎหมายอาหาร ให้คำแนะนำเชิงสร้างสรรค์"
                             specific_focus = "ตรวจสอบความถูกต้องทั่วไปตามมาตรฐาน"
 
-                        final_prompt = f"""
-                        Role: {system_role}
-                        Product Type: {product_type}
-                        Reference Laws: {law_context}
-                        Task:
-                        1. อ่านข้อความบนฉลากในรูปภาพ
-                        2. {specific_focus}
-                        3. เทียบกับ Reference Laws ทีละข้อ
-                        4. ระบุจุดที่ "เสี่ยงผิดกฎหมาย" พร้อมคำแนะนำ
+                        table_header = "| ตำแหน่งบนภาพ | ข้อความที่พบ | กฎหมายที่เกี่ยวข้อง | สถานะ | คำแนะนำ |"
+                        table_divider = "|---|---|---|---|---|"
+
+                        system_prompt = f"""
+                        คุณคือผู้ตรวจสอบฉลากอาหาร อย. (FDA Auditor)
+                        หน้าที่: ตรวจสอบฉลากเทียบกับกฎหมายอย่างละเอียด
+
+                        คำสั่งสำคัญ (STRICT RULES):
+                        1. ถ้าพบความผิดปกติ หรือความเสี่ยงแม้แต่นิดเดียว ให้สรุปว่า "INCORRECT"
+                        2. ห้ามเขียนข้อความเกริ่นนำ หรือสรุปความใดๆ นอกเหนือจากรูปแบบที่กำหนด
+                        3. ให้แสดงผลลัพธ์เป็น 2 ส่วนเท่านั้น:
+                           ส่วนที่ 1: บรรทัดแรกเขียนว่า "VERDICT: [CORRECT]" หรือ "VERDICT: [INCORRECT]"
+                           ส่วนที่ 2: ตาราง Markdown ตามหัวข้อที่กำหนดให้เท่านั้น
+
+                        การกรอกข้อมูลในตาราง:
+                        - ช่อง "สถานะ": ต้องใช้คำว่า "ผ่าน" หรือ "ไม่ผ่าน" เท่านั้น
+                        - ช่อง "กฎหมายที่เกี่ยวข้อง": ระบุชื่อประกาศและข้อให้ชัดเจน
+                        - ช่อง "คำแนะนำ": ถ้าไม่ผ่าน ต้องบอกวิธีแก้ให้ชัดเจน
+                        """
+
+                        user_prompt = f"""
+                        สินค้า: {product_type}
+                        โหมดตรวจสอบ: {specific_focus}
+                        ข้อมูลกฎหมาย: {law_context}
+
+                        จงเติมข้อมูลลงในตารางนี้ให้สมบูรณ์ (ห้ามเปลี่ยนหัวตาราง):
+
+                        VERDICT: [ผลการตัดสิน]
+
+                        {table_header}
+                        {table_divider}
+                        (ให้ AI เขียนแถวข้อมูลต่อจากตรงนี้...)
                         """
 
                         response = client.chat.completions.create(
                             model="gpt-4o",
                             messages=[
-                                {"role": "system", "content": system_role},
+                                {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": [
-                                    {"type": "text", "text": final_prompt},
+                                    {"type": "text", "text": user_prompt},
                                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
                                 ]}
                             ],
@@ -213,7 +249,39 @@ if init_login_page():
                         )
 
                         st.success("เสร็จสิ้น!")
-                        st.markdown(response.choices[0].message.content)
+                        result_text = response.choices[0].message.content
+
+                        if "VERDICT: [INCORRECT]" in result_text or "VERDICT: INCORRECT" in result_text:
+                            st.markdown(
+                                '<div class="verdict-box verdict-fail"><div class="verdict-title">❌ ไม่ผ่าน (FAIL)</div>พบจุดที่ต้องแก้ไขตามกฎหมาย</div>',
+                                unsafe_allow_html=True,
+                            )
+                        elif "VERDICT: [CORRECT]" in result_text or "VERDICT: CORRECT" in result_text:
+                            st.markdown(
+                                '<div class="verdict-box verdict-pass"><div class="verdict-title">✅ ผ่าน (PASS)</div>ฉลากเป็นไปตามเกณฑ์</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        lines = result_text.splitlines()
+                        table_rows = [
+                            line for line in lines
+                            if "|" in line and "ตำแหน่งบนภาพ" not in line and "---" not in line
+                        ]
+
+                        st.markdown("### 📋 รายละเอียดการตรวจสอบ")
+                        if table_rows:
+                            full_table = f"{table_header}\n{table_divider}\n" + "\n".join(table_rows)
+                            st.markdown(full_table)
+                        else:
+                            clean_result = (
+                                result_text
+                                .replace("VERDICT: [CORRECT]", "")
+                                .replace("VERDICT: [INCORRECT]", "")
+                                .replace("VERDICT: CORRECT", "")
+                                .replace("VERDICT: INCORRECT", "")
+                                .strip()
+                            )
+                            st.markdown(clean_result)
 
                     except Exception as e:
                         st.error(f"เกิดข้อผิดพลาด: {e}")
