@@ -2,218 +2,508 @@ import streamlit as st
 import requests
 import base64
 import os
+import json
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
 from openai import OpenAI
+from datetime import datetime
+import io
+from PIL import Image
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except Exception:
+    TESSERACT_AVAILABLE = False
 
 # ==========================================
-# 🔐 ส่วนที่ 1: ตั้งค่าระบบ Login (Firebase)
+# ⚙️ CONFIGURATION
 # ==========================================
+FIREBASE_WEB_API_KEY = "AIzaSyBhTEKwnX6Q1B7alEYcCjBhsnhh_zLfiI4"
+FIREBASE_PROJECT_ID = "food-label-verification-system" 
+ADMIN_EMAIL = "kampeena@gmail.com"
 
-# ⚠️ ใส่ Web API Key จาก Firebase Console ตรงนี้
-FIREBASE_WEB_API_KEY = "AIzaSyBhTEKwnX6Q1B7alEYcCjBhsnhh_zLfiI4" 
+LAW_FOLDER = "law_library"
+
+st.set_page_config(page_title="AI FDA Audit Pro", layout="wide", page_icon="⚖️")
+
+# --- CSS: ปรับแต่งตารางให้สวยงาม ---
+st.markdown("""
+<style>
+    .verdict-box {padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px; font-family: 'Sarabun', sans-serif;}
+    .verdict-pass {background-color: #e6fffa; color: #047857; border: 2px solid #34d399;}
+    .verdict-fail {background-color: #fff5f5; color: #c53030; border: 2px solid #fc8181;}
+    .verdict-title {font-size: 28px !important; font-weight: bold; margin-bottom: 5px !important;}
+    
+    /* สไตล์ตาราง Audit */
+    .audit-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 20px 0;
+        font-size: 16px;
+        font-family: sans-serif;
+        box-shadow: 0 0 20px rgba(0, 0, 0, 0.05);
+        border-radius: 8px; 
+        overflow: hidden;
+    }
+    .audit-table thead tr {
+        background-color: #009879;
+        color: #ffffff;
+        text-align: left;
+    }
+    .audit-table th, .audit-table td {
+        padding: 12px 15px;
+        border-bottom: 1px solid #dddddd;
+        vertical-align: top;
+    }
+    .audit-table tbody tr:nth-of-type(even) {
+        background-color: #f3f3f3;
+    }
+    .audit-table tbody tr:last-of-type {
+        border-bottom: 2px solid #009879;
+    }
+    .status-pass {
+        color: #009879;
+        font-weight: bold;
+        background-color: #e6fffa;
+        padding: 4px 8px;
+        border-radius: 4px;
+        display: inline-block;
+    }
+    .status-fail {
+        color: #dc3545;
+        font-weight: bold;
+        background-color: #fff5f5;
+        padding: 4px 8px;
+        border-radius: 4px;
+        display: inline-block;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 🛠️ HELPER FUNCTIONS
+# ==========================================
+def update_user_status(id_token, user_id, email, approved=False):
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/users/{user_id}?updateMask.fieldPaths=email&updateMask.fieldPaths=approved"
+    is_admin = (email.strip() == ADMIN_EMAIL.strip())
+    final_approve = True if is_admin else approved
+    payload = {
+        "fields": {
+            "email": {"stringValue": email},
+            "approved": {"booleanValue": final_approve},
+            "created_at": {"stringValue": str(datetime.now())}
+        }
+    }
+    requests.patch(url, json=payload, headers={"Authorization": f"Bearer {id_token}"})
+
+def check_user_approval(id_token, user_id):
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/users/{user_id}"
+    res = requests.get(url, headers={"Authorization": f"Bearer {id_token}"})
+    if res.status_code == 200:
+        try: return res.json()["fields"]["approved"]["booleanValue"]
+        except: return False
+    return False
+
+def get_all_users(id_token):
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/users"
+    res = requests.get(url, headers={"Authorization": f"Bearer {id_token}"})
+    users_list = []
+    if res.status_code == 200:
+        docs = res.json().get('documents', [])
+        for doc in docs:
+            try:
+                users_list.append({
+                    "id": doc['name'].split('/')[-1],
+                    "email": doc['fields']['email']['stringValue'],
+                    "approved": doc['fields']['approved']['booleanValue']
+                })
+            except: pass
+    return users_list
 
 def login_user(email, password):
-    # ยิง Request ไปที่ Firebase เพื่อเช็คระหัสผ่าน
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_WEB_API_KEY}"
-    payload = {"email": email, "password": password, "returnSecureToken": True}
-    res = requests.post(url, json=payload)
-    
+    res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
     if res.status_code == 200:
-        return True, res.json()
-    else:
-        return False, res.json().get('error', {}).get('message', 'Unknown error')
+        data = res.json()
+        is_approved = True if email.strip() == ADMIN_EMAIL.strip() else check_user_approval(data['idToken'], data['localId'])
+        return True, data, is_approved
+    return False, res.json().get('error', {}).get('message', 'Unknown'), False
 
-def init_login_page():
-    # ถ้ายังไม่ล็อกอิน ให้โชว์หน้า Login
-    if 'is_logged_in' not in st.session_state:
-        st.session_state['is_logged_in'] = False
-
-    if not st.session_state['is_logged_in']:
-        st.markdown("""<h2 style='text-align: center;'>🔐 เข้าสู่ระบบตรวจสอบฉลาก (Factory Audit)</h2>""", unsafe_allow_html=True)
-        
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            with st.form("login_form"):
-                email = st.text_input("Email ผู้ใช้งาน")
-                password = st.text_input("Password", type="password")
-                submit = st.form_submit_button("เข้าสู่ระบบ")
-                
-                if submit:
-                    success, info = login_user(email, password)
-                    if success:
-                        st.session_state['is_logged_in'] = True
-                        st.session_state['user_email'] = email
-                        st.success("ล็อกอินสำเร็จ! กำลังเข้าสู่ระบบ...")
-                        st.rerun() # รีเฟรชหน้าเพื่อเข้าสู่แอพหลัก
-                    else:
-                        st.error(f"ล็อกอินไม่ผ่าน: {info}")
-        return False # ยังไม่ผ่าน
-    else:
-        # ทำปุ่ม Logout ไว้ที่ Sidebar
-        with st.sidebar:
-            st.write(f"👤 ผู้ใช้: {st.session_state.get('user_email')}")
-            if st.button("ออกจากระบบ (Logout)"):
-                st.session_state['is_logged_in'] = False
-                st.rerun()
-        return True # ผ่านแล้ว
-
-# ==========================================
-# 🏭 ส่วนที่ 2: แอพตรวจสอบฉลาก (Logic เดิม)
-# ==========================================
-
-# ตั้งค่า Path ของโฟลเดอร์เก็บกฎหมาย
-LAW_FOLDER = "law_library"
+def register_user(email, password):
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_WEB_API_KEY}"
+    res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    if res.status_code == 200:
+        data = res.json()
+        update_user_status(data['idToken'], data['localId'], email, approved=False)
+        return True, data
+    return False, res.json().get('error', {}).get('message', 'Unknown')
 
 def get_pdf_text(file_path):
     text = ""
     try:
         reader = PdfReader(file_path)
         for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted
-    except Exception as e:
-        st.error(f"อ่านไฟล์ {file_path} ไม่ได้: {e}")
+            t = page.extract_text()
+            if t: text += t
+    except: pass
     return text
 
 def load_law_files():
-    if not os.path.exists(LAW_FOLDER):
-        os.makedirs(LAW_FOLDER)
-        return []
-    files = [f for f in os.listdir(LAW_FOLDER) if f.endswith('.pdf')]
-    return files
+    if not os.path.exists(LAW_FOLDER): os.makedirs(LAW_FOLDER); return []
+    return [f for f in os.listdir(LAW_FOLDER) if f.endswith('.pdf')]
 
 def get_website_text(url):
-    text = ""
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            text = soup.get_text(separator=' ', strip=True)
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.content, 'html.parser')
+            return soup.get_text(separator=' ', strip=True)
+    except: pass
+    return ""
+
+# === OCR HELPERS ===
+def ocr_image(uploaded_file):
+    """Run OCR on an uploaded image file and return structured data and full text.
+    Requires Tesseract binary available on the system for pytesseract to work.
+    """
+    try:
+        img = Image.open(io.BytesIO(uploaded_file.getvalue())).convert('RGB')
+        # Full text
+        full_text = pytesseract.image_to_string(img, lang='eng+tha') if TESSERACT_AVAILABLE else ""
+        # Detailed data with bounding boxes
+        data = []
+        if TESSERACT_AVAILABLE:
+            raw = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, lang='eng+tha')
+            n = len(raw['text'])
+            for i in range(n):
+                txt = raw['text'][i].strip()
+                if txt:
+                    conf = int(raw['conf'][i]) if raw['conf'][i].isdigit() else -1
+                    data.append({
+                        'text': txt,
+                        'conf': conf,
+                        'left': raw['left'][i],
+                        'top': raw['top'][i],
+                        'width': raw['width'][i],
+                        'height': raw['height'][i]
+                    })
+        return {'text': full_text, 'data': data}
     except Exception as e:
-        st.warning(f"ดึงเว็บ {url} ไม่ได้: {e}")
-    return text
+        return {'text': '', 'data': []}
 
-# --- เริ่มต้นโปรแกรม ---
-st.set_page_config(page_title="Pro FDA Auditor", layout="wide", page_icon="⚖️")
+# ==========================================
+# 🖥️ MAIN APP LOGIC
+# ==========================================
 
-# เช็ค Login ก่อน! ถ้าผ่านถึงจะรันโค้ดข้างล่างนี้
-if init_login_page():
-    
-    st.markdown("""
-        <h1 style='text-align: center; color: #2E86C1;'>⚖️ AI Pro FDA Auditor (Online System)</h1>
-        <p style='text-align: center;'>ระบบตรวจสอบฉลากอาหารอัจฉริยะ (สำหรับภายในโรงงาน)</p>
-        <hr>
-    """, unsafe_allow_html=True)
+if 'is_logged_in' not in st.session_state: st.session_state['is_logged_in'] = False
+if 'is_admin' not in st.session_state: st.session_state['is_admin'] = False
 
-    # Sidebar: ตั้งค่า
+if not st.session_state['is_logged_in']:
+    st.markdown("<h2 style='text-align: center;'>🔐 ระบบตรวจสอบฉลากอาหาร (AI Audit)</h2>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        t1, t2 = st.tabs(["เข้าสู่ระบบ", "สมัครสมาชิก"])
+        with t1:
+            with st.form("login"):
+                email = st.text_input("อีเมล")
+                password = st.text_input("รหัสผ่าน", type="password")
+                if st.form_submit_button("เข้าสู่ระบบ", use_container_width=True):
+                    success, info, approved = login_user(email, password)
+                    if success:
+                        if approved:
+                            st.session_state['is_logged_in'] = True
+                            st.session_state['user_email'] = email
+                            st.session_state['id_token'] = info['idToken']
+                            if email.strip() == ADMIN_EMAIL.strip(): st.session_state['is_admin'] = True
+                            st.rerun()
+                        else: st.warning("⏳ รอการอนุมัติจาก Admin")
+                    else: st.error(f"Error: {info}")
+        with t2:
+            with st.form("reg"):
+                re = st.text_input("อีเมล")
+                rp = st.text_input("รหัสผ่าน (6+ ตัวอักษร)", type="password")
+                if st.form_submit_button("สมัครสมาชิก", use_container_width=True):
+                    if len(rp)<6: st.error("รหัสสั้นไป")
+                    else:
+                        s, i = register_user(re, rp)
+                        if s: st.success("✅ สมัครสำเร็จ! รออนุมัติ")
+                        else: st.error(f"Error: {i}")
+
+else:
     with st.sidebar:
-        st.header("🔑 ตั้งค่าระบบ")
-        # ให้ User ใส่ API Key เอง หรือคุณจะฝังไว้ใน Code เลยก็ได้ถ้ารวย (ไม่แนะนำ)
-        api_key = st.text_input("OpenAI API Key", type="password") 
-        
-        st.markdown("---")
-        st.header("📂 คลังกฎหมาย (Law Library)")
-        law_files = load_law_files()
-        
-        if not law_files:
-            st.warning(f"ไม่พบไฟล์ในโฟลเดอร์ {LAW_FOLDER}")
-        
-        selected_files = st.multiselect(
-            "เลือกกฎหมายที่เกี่ยวข้อง:",
-            law_files,
-            placeholder="เลือกไฟล์ประกาศฯ..."
-        )
+        st.write(f"👤 {st.session_state.get('user_email')}")
+        if st.session_state['is_admin']: st.markdown("🔴 **ADMIN**")
+        if st.button("ออกจากระบบ"):
+            st.session_state['is_logged_in'] = False
+            st.session_state['is_admin'] = False
+            st.rerun()
+        st.divider()
+        app_mode = "Audit"
+        if st.session_state['is_admin']:
+            app_mode = st.radio("เลือกเมนู:", ["ตรวจสอบฉลาก (Audit)", "จัดการผู้ใช้ (Admin)"])
 
-    if api_key:
-        client = OpenAI(api_key=api_key)
+    if st.session_state['is_admin'] and app_mode == "จัดการผู้ใช้ (Admin)":
+        st.header("👥 จัดการผู้ใช้งาน")
+        users = get_all_users(st.session_state['id_token'])
+        pending = [u for u in users if not u['approved']]
+        st.subheader(f"⏳ รออนุมัติ ({len(pending)})")
+        if not pending: st.info("ไม่มีรายการรออนุมัติ")
+        for u in pending:
+            c1, c2 = st.columns([3,1])
+            c1.write(f"📧 {u['email']}")
+            if c2.button("อนุมัติ", key=u['id']):
+                update_user_status(st.session_state['id_token'], u['id'], u['email'], True)
+                st.success("อนุมัติแล้ว")
+                st.rerun()
+    else:
+        # --- AUDIT PAGE ---
+        with st.sidebar:
+            st.header("⚙️ ตั้งค่าการตรวจสอบ")
+            api_key = st.text_input("OpenAI API Key", type="password")
+            if not TESSERACT_AVAILABLE:
+                st.caption("🔎 แนะนำ: ติดตั้ง Tesseract OCR บนระบบเพื่อให้การตรวจข้อความบนภาพละเอียดขึ้น (pytesseract ต้องการ binary)")
+                st.caption("https://github.com/tesseract-ocr/tesseract")
 
-        col1, col2 = st.columns([1, 1.2])
-        
-        with col1:
-            st.subheader("1. ข้อมูลสินค้า")
-            uploaded_image = st.file_uploader("อัปโหลดรูปฉลาก", type=["jpg", "png", "jpeg"])
-            if uploaded_image:
-                st.image(uploaded_image, caption="ตัวอย่างฉลาก", use_column_width=True)
+            double_check = st.checkbox('🔁 เปิดการตรวจสอบซ้ำ (Double-check) (แนะนำ)', value=True)
             
-            product_type = st.text_input("ประเภทอาหาร (เช่น นมพาสเจอร์ไรซ์)", placeholder="ระบุให้ชัดเจน")
-
-        with col2:
-            st.subheader("2. บริบทการตรวจสอบ")
+            # --- Load Files ---
+            all_files = load_law_files()
             
-            st.markdown("### 🚨 โหมดจับผิด")
-            audit_mode = st.radio(
-                "ระดับความเข้มข้น:",
-                ["ตรวจสอบทั่วไป", "ตรวจสอบเข้มข้น / จำลองเรื่องร้องเรียน"]
+            # --- 🔍 ระบบค้นหากฎหมาย (Smart Search) ---
+            st.markdown("### 📂 ค้นหากฎหมาย")
+            search_query = st.text_input("พิมพ์คำค้นหาชื่อไฟล์ (เช่น health, นม):", key="law_search_box")
+            
+            # กรองไฟล์ตามคำค้น (จากชื่อไฟล์)
+            if search_query:
+                filtered_files = [f for f in all_files if search_query.lower() in f.lower()]
+                st.caption(f"🔎 พบ {len(filtered_files)} ไฟล์จากคำค้น")
+            else:
+                filtered_files = all_files
+            
+            # เตรียม State สำหรับเก็บค่าที่เลือก (ป้องกันค่าหายเมื่อค้นหาใหม่)
+            if 'selected_laws_state' not in st.session_state:
+                st.session_state['selected_laws_state'] = []
+
+            # ปุ่มเลือกทั้งหมด (แสดงเฉพาะเมื่อมีการค้นหาและเจอผลลัพธ์)
+            if search_query and filtered_files:
+                if st.button(f"✅ เลือกทั้งหมดที่เจอ ({len(filtered_files)})"):
+                    # รวมของใหม่เข้ากับของเดิม (ไม่เอาตัวซ้ำ)
+                    current_set = set(st.session_state['selected_laws_state'])
+                    current_set.update(filtered_files)
+                    st.session_state['selected_laws_state'] = list(current_set)
+                    st.rerun()
+            
+            if search_query and st.button("ล้างคำค้นหา"):
+                st.session_state.law_search_box = "" # ล้างช่องค้นหา
+                st.rerun()
+
+            # --- Logic สำคัญ: รวมไฟล์ที่ค้นเจอเข้ากับไฟล์ที่เลือกไว้แล้ว เพื่อไม่ให้ของเก่าหาย ---
+            # Options = (ไฟล์ที่ค้นเจอ) UNION (ไฟล์ที่เคยเลือกไปแล้ว)
+            display_options = list(set(filtered_files + st.session_state['selected_laws_state']))
+            display_options.sort() # เรียงตามตัวอักษร
+
+            sel_files = st.multiselect(
+                "รายการกฎหมายที่เลือกใช้:",
+                options=display_options,
+                key='selected_laws_state' # ผูกกับ Session State โดยตรง
             )
             
-            complaint_details = ""
-            if "เข้มข้น" in audit_mode:
-                st.warning("⚠️ AI จะเพ่งเล็งจุดเล็กๆ น้อยๆ เป็นพิเศษ")
-                complaint_details = st.text_area("ระบุประเด็นที่กังวล (ถ้ามี):", height=100)
+            if sel_files:
+                st.success(f"📌 เลือกไว้แล้ว: {len(sel_files)} ฉบับ")
 
-            st.markdown("---")
-            extra_url = st.text_input("ลิงก์กฎหมายเพิ่มเติม (URL)")
-            extra_text = st.text_area("ข้อความกฎหมายเพิ่มเติม", height=100)
+        st.title("📋 รายงานผลการตรวจสอบ (Audit Report)")
+        
+        c1, c2 = st.columns([1, 1.5])
+        with c1:
+            st.info("1. ข้อมูลสินค้า")
+            img = st.file_uploader("รูปภาพฉลากสินค้า", type=["jpg","png","jpeg"])
+            if img: st.image(img, caption="ฉลากที่อัปโหลด", use_column_width=True)
+            ptype = st.text_input("ประเภทอาหาร (เช่น นม, ขนม)")
+            with st.expander("ข้อมูลเพิ่มเติม"):
+                url = st.text_input("URL กฎหมาย")
+                note = st.text_area("หมายเหตุ")
+            
+            btn = st.button("🚀 เริ่มการตรวจสอบ", type="primary", use_container_width=True)
 
-        # ปุ่มตรวจสอบ
-        if st.button("เริ่มการตรวจสอบ (Audit Now) ⚡", type="primary"):
-            if not uploaded_image or not product_type:
-                st.error("กรุณาอัปโหลดรูปและระบุประเภทอาหาร")
-            elif not selected_files and not extra_text and not extra_url:
-                st.warning("⚠️ กรุณาเลือกกฎหมายอ้างอิงอย่างน้อย 1 อย่าง")
-            else:
-                with st.spinner("🤖 AI กำลังสวมบทบาทเจ้าหน้าที่ ตรวจสอบข้อมูล..."):
-                    try:
-                        # 1. รวบรวมกฎหมาย
-                        law_context = ""
-                        for file_name in selected_files:
-                            file_path = os.path.join(LAW_FOLDER, file_name)
-                            law_context += f"\n\n--- กฎหมาย: {file_name} ---\n{get_pdf_text(file_path)}"
-                        
-                        if extra_url: law_context += f"\n\n--- เว็บ: {extra_url} ---\n{get_website_text(extra_url)}"
-                        if extra_text: law_context += f"\n\n--- เพิ่มเติม ---\n{extra_text}"
+        with c2:
+            st.info("2. ผลการตรวจสอบ")
+            if btn:
+                if not api_key or not img:
+                    st.error("กรุณาใส่ API Key และอัปโหลดรูปภาพ")
+                else:
+                    with st.spinner("🤖 AI กำลังตรวจสอบอย่างละเอียด (รวมถึงจุดเสี่ยงเล็กๆ น้อยๆ)..."):
+                        try:
+                            client = OpenAI(api_key=api_key)
                             
-                        law_context = law_context[:60000]
+                            law_ctx = ""
+                            for f in sel_files: law_ctx += f"\n[ไฟล์: {f}]\n{get_pdf_text(os.path.join(LAW_FOLDER,f))}"
+                            if url: law_ctx += f"\n[เว็บ: {url}]\n{get_website_text(url)}"
+                            if note: law_ctx += f"\n[หมายเหตุ: {note}]"
+                            
+                            # OCR: try to extract text and pass to the model (if available)
+                            ocr_result = None
+                            ocr_text = ""
+                            if TESSERACT_AVAILABLE:
+                                ocr_result = ocr_image(img)
+                                ocr_text = ocr_result.get('text','').strip()
 
-                        # 2. เตรียมรูป
-                        base64_image = base64.b64encode(uploaded_image.getvalue()).decode('utf-8')
+                            b64_img = base64.b64encode(img.getvalue()).decode('utf-8')
 
-                        # 3. Prompt
-                        if "เข้มข้น" in audit_mode:
-                            system_role = "คุณคือผู้ตรวจสอบฉลากอาหารอาวุโส ที่มีความเข้มงวดสูงสุด เน้นจับผิด"
-                            specific_focus = f"ตรวจสอบประเด็นร้องเรียนเรื่อง: '{complaint_details}' อย่างละเอียด"
-                        else:
-                            system_role = "คุณคือผู้เชี่ยวชาญด้านกฎหมายอาหาร ให้คำแนะนำเชิงสร้างสรรค์"
-                            specific_focus = "ตรวจสอบความถูกต้องทั่วไปตามมาตรฐาน"
+                            # --- PROMPT: บังคับตาราง + บังคับตรวจจุดอ่อนไหว (เข้มงวดสูงสุด) ---
+                            sys_prompt = """
+                            คุณคือผู้ตรวจสอบฉลากอาหาร อย. (FDA Auditor) ที่ละเอียดที่สุด และให้ความสำคัญสูงสุดกับการค้นหาข้อความที่อาจขัดกับกฎหมาย
 
-                        final_prompt = f"""
-                        Role: {system_role}
-                        Product Type: {product_type}
-                        Reference Laws: {law_context}
-                        Task:
-                        1. อ่านข้อความบนฉลากในรูปภาพ
-                        2. {specific_focus}
-                        3. เทียบกับ Reference Laws ทีละข้อ
-                        4. ระบุจุดที่ "เสี่ยงผิดกฎหมาย" พร้อมคำแนะนำ
-                        """
+                            กฎสำคัญ (MUST):
+                            1) ห้ามเขียนข้อความนอกเหนือจาก 1) บรรทัด VERDICT และ 2) ตาราง Markdown ที่มี 5 คอลัมน์ตามหัวต่อไปนี้เท่านั้น:
+                               | ตำแหน่งบนภาพ | ข้อความที่พบ | กฎหมายที่เกี่ยวข้อง | สถานะ | คำแนะนำ |
+                            2) ช่อง "สถานะ" ต้องเป็นคำว่า "ผ่าน" หรือ "ไม่ผ่าน" เท่านั้น
+                            3) หากข้อความจากภาพไม่ชัด (ตัวอักษรเล็ก/เบลอ/ซ้อนพื้นหลัง) ให้ใส่คำว่า "(UNREADABLE)" และระบุคะแนนความมั่นใจ 0-100 ในช่อง "คำแนะนำ"
+                            4) ในกรณี "ไม่ผ่าน" ให้ระบุหลักฐานจากฉลาก (quote จาก OCR หรือคำที่พบบนภาพ) และอ้างอิงกฎหมายพร้อมข้อ/มาตรา และให้คำแนะนำการแก้ไขที่ชัดเจน
+                            5) ห้ามเพิ่มคอลัมน์หรือข้อความนอกตาราง
 
-                        response = client.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[
-                                {"role": "system", "content": system_role},
-                                {"role": "user", "content": [
-                                    {"type": "text", "text": final_prompt},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                                ]}
-                            ],
-                            max_tokens=3000,
-                        )
+                            ตัวอย่างแถว (ภาษาไทย):
+                            | ด้านบนขวา | "12 เดือนขึ้นไป" | ประกาศกระทรวงสาธารณสุข (ข้อ 2) | ไม่ผ่าน | หลักฐานจากฉลาก: '12 เดือนขึ้นไป' [conf:85]; แนะนำ: เพิ่มคำชี้แจงเกี่ยวกับอายุ |
+                            """
 
-                        st.success("เสร็จสิ้น!")
-                        st.markdown(response.choices[0].message.content)
+                            user_prompt = f"""
+                            สินค้า: {ptype}
+                            ข้อมูลกฎหมาย: {law_ctx[:50000]}
+                            OCR_TEXT (ตัด): {ocr_text[:20000]}
 
-                    except Exception as e:
-                        st.error(f"เกิดข้อผิดพลาด: {e}")
+                            จงเติมข้อมูลลงในตารางนี้ให้สมบูรณ์ (ห้ามเปลี่ยนหัวตาราง):
+
+                            VERDICT: [ผลการตัดสิน]
+
+                            | ตำแหน่งบนภาพ | ข้อความที่พบ | กฎหมายที่เกี่ยวข้อง | สถานะ | คำแนะนำ |
+                            |---|---|---|---|---|
+
+                            (ให้ AI เขียนแถวข้อมูลต่อจากตรงนี้...)
+                            """
+
+                            resp = client.chat.completions.create(
+                                model="gpt-4o",
+                                messages=[
+                                    {"role": "system", "content": sys_prompt},
+                                    {"role": "user", "content": [
+                                        {"type":"text","text":user_prompt},
+                                        {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64_img}"}}
+                                    ]}
+                                ],
+                                max_tokens=3000
+                            )
+                            res = resp.choices[0].message.content
+
+                            # --- แยกผลลัพธ์เพื่อแสดงผล ---
+                            # 1. VERDICT
+                            verdict = None
+                            for line in res.split('\n'):
+                                if line.strip().upper().startswith('VERDICT:'):
+                                    verdict = line.split(':',1)[1].strip()
+                                    break
+
+                            if verdict and ('INCORRECT' in verdict or 'ไม่ถูกต้อง' in verdict):
+                                st.markdown('<div class="verdict-box verdict-fail"><div class="verdict-title">❌ ไม่ถูกต้อง (FAIL)</div>พบจุดที่ต้องแก้ไข (รวมถึงรายละเอียดทางเทคนิค)</div>', unsafe_allow_html=True)
+                            elif verdict and ('CORRECT' in verdict or 'ถูกต้อง' in verdict):
+                                st.markdown('<div class="verdict-box verdict-pass"><div class="verdict-title">✅ ถูกต้อง (PASS)</div>ฉลากเป็นไปตามเกณฑ์</div>', unsafe_allow_html=True)
+                            else:
+                                st.warning('ไม่สามารถระบุ VERDICT ได้อย่างชัดเจน')
+
+                            # 2. Parse table rows robustly and enforce 5 columns
+                            lines = res.split('\n')
+                            table_rows = []
+                            for line in lines:
+                                if '|' in line and 'ตำแหน่งบนภาพ' not in line and '---' not in line:
+                                    raw_cells = [c.strip() for c in line.strip().strip('|').split('|')]
+                                    # Normalize to exactly 5 columns
+                                    if len(raw_cells) > 5:
+                                        raw_cells = raw_cells[:4] + [' | '.join(raw_cells[4:])]
+                                    elif len(raw_cells) < 5:
+                                        raw_cells += [''] * (5 - len(raw_cells))
+
+                                    # Normalize status
+                                    status = raw_cells[3]
+                                    if status not in ['ผ่าน','ไม่ผ่าน']:
+                                        s_low = status.lower()
+                                        if 'pass' in s_low or 'correct' in s_low or 'ผ่าน' in status:
+                                            status = 'ผ่าน'
+                                        elif 'fail' in s_low or 'incorrect' in s_low or 'ไม่ผ่าน' in status:
+                                            status = 'ไม่ผ่าน'
+                                        else:
+                                            # leave as-is but mark as ambiguous
+                                            status = status
+                                    raw_cells[3] = status
+                                    table_rows.append(raw_cells)
+
+                            # 3. แสดงผลตาราง
+                            if table_rows:
+                                html = '<table class="audit-table"><thead><tr>' + ''.join([f'<th>{h}</th>' for h in ['ตำแหน่งบนภาพ','ข้อความที่พบ','กฎหมายที่เกี่ยวข้อง','สถานะ','คำแนะนำ']]) + '</tr></thead><tbody>'
+                                for row in table_rows:
+                                    status_html = row[3]
+                                    if 'ไม่ผ่าน' in row[3]:
+                                        status_html = f'<span class="status-fail">{row[3]}</span>'
+                                    elif 'ผ่าน' in row[3]:
+                                        status_html = f'<span class="status-pass">{row[3]}</span>'
+                                    html += f"<tr><td>{row[0]}</td><td>{row[1]}</td><td>{row[2]}</td><td style='text-align:center;'>{status_html}</td><td>{row[4]}</td></tr>"
+                                html += '</tbody></table>'
+                                st.markdown(html, unsafe_allow_html=True)
+
+                                # Show OCR snippets and low confidence tokens for auditor
+                                if TESSERACT_AVAILABLE and ocr_result:
+                                    with st.expander('🔎 OCR: ข้อความที่ดึงจากภาพ (ตัด):'):
+                                        st.text_area('OCR Extract (ตัวอย่าง):', ocr_text[:3000], height=180)
+                                        # show low confidence tokens
+                                        lows = [d for d in ocr_result.get('data',[]) if d.get('conf',-1) < 60]
+                                        if lows:
+                                            st.write('⚠️ พบคำที่มีความมั่นใจต่ำ (conf<60):')
+                                            for t in lows[:20]:
+                                                st.write(f"- '{t['text']}' (conf: {t['conf']}, pos: {t['left']},{t['top']})")
+
+                                # Optional: double-check each row using a follow-up verification
+                                try:
+                                    if double_check and table_rows:
+                                        verification_lines = []
+                                        for i, r in enumerate(table_rows, start=1):
+                                            verification_lines.append(f"ROW {i}: |{r[0]}|{r[1]}|{r[2]}|{r[3]}|{r[4]}|")
+                                        verify_prompt = "Please verify each ROW strictly. For each ROW, return a single line in this exact format:\nROW <n>: CONFIRM: YES or NO; NOTE: <short reason>; CITATION: <law reference if any>\nDo not output anything else."
+                                        verify_user = f"OCR_TEXT:\n{ocr_text[:20000]}\n\nLAWS:\n{law_ctx[:50000]}\n\nTABLE_1:\n" + "\n".join(verification_lines)
+                                        vresp = client.chat.completions.create(
+                                            model='gpt-4o',
+                                            messages=[
+                                                {'role':'system', 'content': 'You are a strict verifier. Only answer in the required single-line form for each row.'},
+                                                {'role':'user', 'content': verify_prompt + "\n\n" + verify_user}
+                                            ],
+                                            max_tokens=1200
+                                        )
+                                        vtext = vresp.choices[0].message.content
+
+                                        # parse verifier output
+                                        review_results = {}
+                                        for line in vtext.split('\n'):
+                                            if line.strip().startswith('ROW'):
+                                                parts = line.split(':',1)
+                                                if len(parts) == 2:
+                                                    key = parts[0].strip()
+                                                    review_results[key] = parts[1].strip()
+
+                                        # display results next to each row
+                                        st.markdown('### 🔁 ผลการตรวจสอบซ้ำ (Double-check)')
+                                        for i, r in enumerate(table_rows, start=1):
+                                            key = f'ROW {i}'
+                                            note = review_results.get(key, 'No verification result')
+                                            st.write(f"- Row {i}: {r[1]} --> {note}")
+                                except Exception as e:
+                                    st.info('การตรวจสอบซ้ำล้มเหลว: ' + str(e))
+
+                            else:
+                                clean_res = res.replace('VERDICT: [CORRECT]','').replace('VERDICT: [INCORRECT]','').strip()
+                                st.warning('แสดงผลรูปแบบข้อความ (ไม่สามารถสร้างตารางได้)')
+                                st.markdown(clean_res)
+
+                            # Debug: raw AI output (for auditing and troubleshooting)
+                            st.markdown('### 🛠️ Debug: Raw AI Output')
+                            st.code(res)
+
+
+                        except Exception as e:
+                            st.error(f"เกิดข้อผิดพลาด: {e}")

@@ -1,5 +1,8 @@
-streamlit
-openai
+streamlit==<pythoncore-3.14-64>
 requests
 beautifulsoup4
-pypdf2
+pillow
+pytesseract
+PyPDF2
+openai
+beautifulsoup4
