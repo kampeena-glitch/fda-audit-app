@@ -1,0 +1,25 @@
+# Local environments
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# Large Binaries
+*.exe
+*.msi
+tesseract-ocr-w64-setup-5.4.0.20240606.exe
+
+# Local configs and data
+.streamlit/secrets.toml
+scraped_history.json
+*log.txt
+
+# OS Files
+.DS_Store
+Thumbs.db
