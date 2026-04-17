@@ -18,7 +18,7 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_KEY_HERE")
 
 ADMIN_EMAIL = st.secrets.get("ADMIN_EMAIL", "kampeena@gmail.com")
 FIREBASE_WEB_API_KEY = st.secrets.get("FIREBASE_WEB_API_KEY", "YOUR_KEY_HERE")
-FIREBASE_PROJECT_ID = st.secrets.get("FIREBASE_PROJECT_ID", "gen-lang-client-0731069779") 
+FIREBASE_PROJECT_ID = st.secrets.get("FIREBASE_PROJECT_ID", "gen-lang-client-0725551315") 
 LAW_FOLDER = "law_library"
 
 # Configure Gemini AI
