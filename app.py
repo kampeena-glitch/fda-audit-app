@@ -11,14 +11,23 @@ from PIL import Image
 import google.generativeai as genai
 
 # ==========================================
-# ⚙️ CONFIGURATION (Loaded from Streamlit Secrets)
+# ⚙️ CONFIGURATION (Loaded from Environment Variables or Streamlit Secrets)
 # ==========================================
-# Gemini API Key (Direct from Google AI Studio)
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_KEY_HERE")
+def get_config(key, default=""):
+    """Read from OS environment first (Cloud Run), then Streamlit secrets, then default."""
+    import os
+    val = os.environ.get(key)
+    if val:
+        return val
+    try:
+        return st.secrets[key]
+    except:
+        return default
 
-ADMIN_EMAIL = st.secrets.get("ADMIN_EMAIL", "kampeena@gmail.com")
-FIREBASE_WEB_API_KEY = st.secrets.get("FIREBASE_WEB_API_KEY", "YOUR_KEY_HERE")
-FIREBASE_PROJECT_ID = st.secrets.get("FIREBASE_PROJECT_ID", "food-label-verification-system") 
+GEMINI_API_KEY = get_config("GEMINI_API_KEY")
+ADMIN_EMAIL = get_config("ADMIN_EMAIL", "kampeena@gmail.com")
+FIREBASE_WEB_API_KEY = get_config("FIREBASE_WEB_API_KEY")
+FIREBASE_PROJECT_ID = get_config("FIREBASE_PROJECT_ID", "food-label-verification-system")
 LAW_FOLDER = "law_library"
 
 # Configure Gemini AI
